@@ -1,0 +1,24 @@
+{
+  "name": "pi-review",
+  "version": "0.1.2",
+  "description": "Fresh-context code review commands for pi.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "code-review",
+    "agent-review"
+  ],
+  "pi": {
+    "extensions": ["./extensions/pi-review"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  }
+}
