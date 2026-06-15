@@ -7,13 +7,53 @@ Fresh-context code review commands for [pi](https://pi.dev).
 ## Install
 
 ```bash
-pi install git:github.com/frankapps-labs/pi-review@v0.1.0
+pi install git:github.com/frankapps-labs/pi-review@v0.1.2
+```
+
+Then restart pi, or run `/reload` in an already-open pi session.
+
+Verify the package is installed:
+
+```bash
+pi list
+```
+
+You should see `git:github.com/frankapps-labs/pi-review@v0.1.2`. In pi, `/review-help` should list the review commands.
+
+## Update
+
+If you installed from the pinned git tag, move to a newer release by installing the newer tag:
+
+```bash
+pi install git:github.com/frankapps-labs/pi-review@v0.1.2
+```
+
+Then restart pi, or run `/reload` in an already-open pi session.
+
+To reconcile the currently pinned checkout without changing tags:
+
+```bash
+pi update --extension git:github.com/frankapps-labs/pi-review@v0.1.2
+```
+
+To see what is installed:
+
+```bash
+pi list
+```
+
+`pi-review` also checks GitHub tags once per pi process when you run a `/review-*` command and warns if a newer release is available. Set `PI_OFFLINE=1` to skip the check.
+
+If you want to try it for one run without installing it permanently:
+
+```bash
+pi -e git:github.com/frankapps-labs/pi-review@v0.1.2
 ```
 
 For local development:
 
 ```bash
-pi -e ./extensions/pi-review
+pi -e ./extensions/pi-review/index.ts
 ```
 
 ## Quick examples
@@ -107,6 +147,27 @@ PI_REVIEW_RECORD_DIR=reviews pi
 ```
 
 Relative override paths are resolved from the git root when available, otherwise from the current working directory.
+
+Fresh review records include token and cost usage when the nested pi provider reports it. Duo review records include a breakdown for the terse, deep, and synthesis subprocesses plus a total.
+
+## Troubleshooting install
+
+If `/review-help` is not available after install:
+
+1. Restart pi, or run `/reload` in the current pi session.
+2. Confirm the package is in settings with `pi list`.
+3. Make sure your pi version supports packages: `pi update --self`, then reinstall.
+4. Reconcile the pinned git checkout if needed:
+
+   ```bash
+   pi update --extension git:github.com/frankapps-labs/pi-review@v0.1.2
+   ```
+
+For machines where GitHub SSH is not configured, the shorthand above should still use a public GitHub clone. If your git config rewrites GitHub URLs to SSH, use the explicit HTTPS form instead:
+
+```bash
+pi install https://github.com/frankapps-labs/pi-review@v0.1.2
+```
 
 ## Security
 

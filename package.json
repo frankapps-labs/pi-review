@@ -11,7 +11,7 @@
     "agent-review"
   ],
   "pi": {
-    "extensions": ["./extensions/pi-review"]
+    "extensions": ["./extensions/pi-review/index.ts"]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

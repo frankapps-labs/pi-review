@@ -2,6 +2,12 @@ import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { saveReviewRecord } from "./review-records";
 
+const CURRENT_VERSION = "0.1.2";
+const TAGS_URL = "https://api.github.com/repos/frankapps-labs/pi-review/tags?per_page=20";
+
+let updateCheckStarted = false;
+let updateWarningShown = false;
+
 type ReviewMode = "diff" | "staged" | "branch" | "codebase";
 
 let reviewModel: string | undefined;
@@ -122,11 +128,78 @@ type ReviewProgress = {
 	stderrBytes: number;
 };
 
+type ReviewUsage = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	totalTokens: number;
+	cost: {
+		input?: number;
+		output?: number;
+		cacheRead?: number;
+		cacheWrite?: number;
+		total: number;
+	};
+};
+
+type PiReviewResult = { code: number; output: string; stderr: string; usage?: ReviewUsage };
+
 function formatKb(bytes: number): string {
 	return `${(bytes / 1024).toFixed(1)}KB`;
 }
 
-async function runPiReview(ctx: ExtensionCommandContext, model: string, prompt: string, progress?: ReviewProgress): Promise<{ code: number; output: string; stderr: string }> {
+function formatCost(usage?: ReviewUsage): string {
+	return usage ? `$${usage.cost.total.toFixed(4)}` : "cost unavailable";
+}
+
+function normalizeUsage(value: unknown): ReviewUsage | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const usage = value as Record<string, unknown>;
+	const cost = usage.cost && typeof usage.cost === "object" ? usage.cost as Record<string, unknown> : undefined;
+	const input = Number(usage.input ?? 0);
+	const output = Number(usage.output ?? 0);
+	const cacheRead = Number(usage.cacheRead ?? 0);
+	const cacheWrite = Number(usage.cacheWrite ?? 0);
+	const totalTokens = Number(usage.totalTokens ?? input + output + cacheRead + cacheWrite);
+	const totalCost = Number(cost?.total ?? 0);
+	if (![input, output, cacheRead, cacheWrite, totalTokens, totalCost].every(Number.isFinite)) return undefined;
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		totalTokens,
+		cost: {
+			input: typeof cost?.input === "number" ? cost.input : undefined,
+			output: typeof cost?.output === "number" ? cost.output : undefined,
+			cacheRead: typeof cost?.cacheRead === "number" ? cost.cacheRead : undefined,
+			cacheWrite: typeof cost?.cacheWrite === "number" ? cost.cacheWrite : undefined,
+			total: totalCost,
+		},
+	};
+}
+
+function sumUsage(...items: Array<ReviewUsage | undefined>): ReviewUsage | undefined {
+	const usages = items.filter((item): item is ReviewUsage => Boolean(item));
+	if (usages.length === 0) return undefined;
+	return {
+		input: usages.reduce((sum, usage) => sum + usage.input, 0),
+		output: usages.reduce((sum, usage) => sum + usage.output, 0),
+		cacheRead: usages.reduce((sum, usage) => sum + usage.cacheRead, 0),
+		cacheWrite: usages.reduce((sum, usage) => sum + usage.cacheWrite, 0),
+		totalTokens: usages.reduce((sum, usage) => sum + usage.totalTokens, 0),
+		cost: {
+			input: usages.reduce((sum, usage) => sum + (usage.cost.input ?? 0), 0),
+			output: usages.reduce((sum, usage) => sum + (usage.cost.output ?? 0), 0),
+			cacheRead: usages.reduce((sum, usage) => sum + (usage.cost.cacheRead ?? 0), 0),
+			cacheWrite: usages.reduce((sum, usage) => sum + (usage.cost.cacheWrite ?? 0), 0),
+			total: usages.reduce((sum, usage) => sum + usage.cost.total, 0),
+		},
+	};
+}
+
+async function runPiReview(ctx: ExtensionCommandContext, model: string, prompt: string, progress?: ReviewProgress): Promise<PiReviewResult> {
 	const piArgs = [
 		"--mode", "json",
 		"-p",
@@ -136,11 +209,12 @@ async function runPiReview(ctx: ExtensionCommandContext, model: string, prompt: 
 		prompt,
 	];
 
-	return await new Promise<{ code: number; output: string; stderr: string }>((resolve) => {
+	return await new Promise<PiReviewResult>((resolve) => {
 		const proc = spawn("pi", piArgs, { cwd: ctx.cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
 		let stdout = "";
 		let stderr = "";
 		let final = "";
+		let usage: ReviewUsage | undefined;
 		let buffer = "";
 
 		const processLine = (line: string) => {
@@ -156,6 +230,7 @@ async function runPiReview(ctx: ExtensionCommandContext, model: string, prompt: 
 					for (const part of event.message.content ?? []) {
 						if (part.type === "text") final = part.text;
 					}
+					usage = normalizeUsage(event.message.usage) ?? usage;
 				}
 			} catch {
 				// ignore non-json noise
@@ -175,7 +250,7 @@ async function runPiReview(ctx: ExtensionCommandContext, model: string, prompt: 
 		});
 		proc.on("close", (code) => {
 			if (buffer.trim()) processLine(buffer);
-			resolve({ code: code ?? 0, output: final || stdout.trim(), stderr });
+			resolve({ code: code ?? 0, output: final || stdout.trim(), stderr, usage });
 		});
 		proc.on("error", (err) => resolve({ code: 1, output: "", stderr: String(err) }));
 	});
@@ -220,8 +295,17 @@ async function runFreshReview(pi: ExtensionAPI, ctx: ExtensionCommandContext, mo
 		return;
 	}
 
-	ctx.ui.notify(`Fresh review done in ${elapsed}s`, "info");
-	piSendAsMessage(pi, `Fresh review (${model}, ${elapsed}s)\n\n${result.output || "No output."}`);
+	const savedPath = saveFreshReviewRecord(ctx, {
+		model,
+		target: args.trim() || defaultTarget(mode),
+		args,
+		mode,
+		elapsedSeconds: elapsed,
+		output: result.output || "No output.",
+		usage: result.usage,
+	});
+	ctx.ui.notify(`Fresh review done in ${elapsed}s; ${formatCost(result.usage)}; saved review record`, "info");
+	piSendAsMessage(pi, `Fresh review (${model}, ${elapsed}s, ${formatCost(result.usage)})\nSaved review record: ${savedPath}\n\n${result.output || "No output."}`);
 }
 
 async function runFreshDuoReview(pi: ExtensionAPI, ctx: ExtensionCommandContext, mode: ReviewMode, args: string): Promise<void> {
@@ -287,6 +371,7 @@ async function runFreshDuoReview(pi: ExtensionAPI, ctx: ExtensionCommandContext,
 		return;
 	}
 
+	const totalUsage = sumUsage(terse.usage, deep.usage, synthesis.usage);
 	const savedPath = saveDuoReviewRecord(ctx, {
 		model,
 		target,
@@ -295,9 +380,45 @@ async function runFreshDuoReview(pi: ExtensionAPI, ctx: ExtensionCommandContext,
 		terse: terse.output,
 		deep: deep.output,
 		synthesis: synthesis.output || "No output.",
+		usage: {
+			terse: terse.usage,
+			deep: deep.usage,
+			synthesis: synthesis.usage,
+			total: totalUsage,
+		},
 	});
-	ctx.ui.notify(`Duo review done in ${elapsed}s; saved review record`, "info");
-	piSendAsMessage(pi, `Duo review (${model}, ${elapsed}s)\nSaved review record: ${savedPath}\n\n${synthesis.output || "No output."}`);
+	ctx.ui.notify(`Duo review done in ${elapsed}s; ${formatCost(totalUsage)}; saved review record`, "info");
+	piSendAsMessage(pi, `Duo review (${model}, ${elapsed}s, ${formatCost(totalUsage)})\nSaved review record: ${savedPath}\nUsage: terse ${formatCost(terse.usage)}, deep ${formatCost(deep.usage)}, synthesis ${formatCost(synthesis.usage)}\n\n${synthesis.output || "No output."}`);
+}
+
+function saveFreshReviewRecord(ctx: ExtensionCommandContext, data: {
+	model: string;
+	target: string;
+	args: string;
+	mode: ReviewMode;
+	elapsedSeconds: number;
+	output: string;
+	usage?: ReviewUsage;
+}): string {
+	return saveReviewRecord(ctx, {
+		kind: "fresh_review",
+		schema: "pi_review.fresh_review_record.v1",
+		slugParts: [data.target],
+		payload: {
+			model: data.model,
+			target: data.target,
+			args: data.args,
+			elapsed_seconds: data.elapsedSeconds,
+			review_command: `${data.mode === "staged" ? "/review-fresh-staged" : data.mode === "branch" ? "/review-fresh-branch" : "/review-fresh"} ${data.args}`.trim(),
+			review: data.output,
+			usage: data.usage,
+			human_verdict: "pending",
+			accepted_findings: [],
+			rejected_findings: [],
+			fix_summary: "pending",
+			validation: [],
+		},
+	});
 }
 
 function saveDuoReviewRecord(ctx: ExtensionCommandContext, data: {
@@ -308,6 +429,12 @@ function saveDuoReviewRecord(ctx: ExtensionCommandContext, data: {
 	terse: string;
 	deep: string;
 	synthesis: string;
+	usage: {
+		terse?: ReviewUsage;
+		deep?: ReviewUsage;
+		synthesis?: ReviewUsage;
+		total?: ReviewUsage;
+	};
 }): string {
 	return saveReviewRecord(ctx, {
 		kind: "duo_review",
@@ -324,6 +451,7 @@ function saveDuoReviewRecord(ctx: ExtensionCommandContext, data: {
 				deep: data.deep,
 				synthesis: data.synthesis,
 			},
+			usage: data.usage,
 			human_verdict: "pending",
 			accepted_findings: [],
 			rejected_findings: [],
@@ -341,75 +469,127 @@ function piSendAsMessage(pi: ExtensionAPI, content: string) {
 	});
 }
 
+function parseVersion(version: string): number[] | undefined {
+	const match = version.replace(/^v/, "").match(/^(\d+)\.(\d+)\.(\d+)$/);
+	if (!match) return undefined;
+	return match.slice(1).map((part) => Number(part));
+}
+
+function isNewerVersion(candidate: string, current: string): boolean {
+	const left = parseVersion(candidate);
+	const right = parseVersion(current);
+	if (!left || !right) return false;
+	for (let i = 0; i < 3; i++) {
+		if (left[i] > right[i]) return true;
+		if (left[i] < right[i]) return false;
+	}
+	return false;
+}
+
+async function latestReleaseTag(): Promise<string | undefined> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 2500);
+	try {
+		const response = await fetch(TAGS_URL, {
+			signal: controller.signal,
+			headers: { "user-agent": "pi-review" },
+		});
+		if (!response.ok) return undefined;
+		const tags = await response.json() as Array<{ name?: string }>;
+		return tags.map((tag) => tag.name).filter((name): name is string => Boolean(name)).sort((a, b) => isNewerVersion(a, b) ? -1 : isNewerVersion(b, a) ? 1 : 0)[0];
+	} catch {
+		return undefined;
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function warnIfUpdateAvailable(ctx: ExtensionCommandContext): void {
+	if (process.env.PI_OFFLINE === "1" || updateCheckStarted || updateWarningShown) return;
+	updateCheckStarted = true;
+	void latestReleaseTag().then((latest) => {
+		if (!latest || updateWarningShown || !isNewerVersion(latest, CURRENT_VERSION)) return;
+		updateWarningShown = true;
+		ctx.ui.notify(`pi-review ${latest} is available; installed ${CURRENT_VERSION}. Update with: pi install git:github.com/frankapps-labs/pi-review@${latest}`, "warning");
+	});
+}
+
+function reviewHandler(handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> | void) {
+	return async (args: string, ctx: ExtensionCommandContext) => {
+		warnIfUpdateAvailable(ctx);
+		await handler(args, ctx);
+	};
+}
+
 export default function reviewRecent(pi: ExtensionAPI) {
 	pi.registerCommand("review-recent", {
 		description: "Review recent changes with terse file:line findings",
-		handler: async (args, ctx) => dispatch(pi, ctx, reviewPrompt("diff", args)),
+		handler: reviewHandler(async (args, ctx) => dispatch(pi, ctx, reviewPrompt("diff", args))),
 	});
 
 	pi.registerCommand("review-staged", {
 		description: "Review staged changes only",
-		handler: async (args, ctx) => dispatch(pi, ctx, reviewPrompt("staged", args)),
+		handler: reviewHandler(async (args, ctx) => dispatch(pi, ctx, reviewPrompt("staged", args))),
 	});
 
 	pi.registerCommand("review-branch", {
 		description: "Review current branch against upstream/main",
-		handler: async (args, ctx) => dispatch(pi, ctx, reviewPrompt("branch", args)),
+		handler: reviewHandler(async (args, ctx) => dispatch(pi, ctx, reviewPrompt("branch", args))),
 	});
 
 	pi.registerCommand("review-focus", {
 		description: "Review with a specific focus, e.g. concurrency or API breaks",
-		handler: async (args, ctx) => {
+		handler: reviewHandler(async (args, ctx) => {
 			const focus = args.trim();
 			if (!focus) {
 				ctx.ui.notify("Usage: /review-focus <focus/scope>", "warning");
 				return;
 			}
 			dispatch(pi, ctx, reviewPrompt("diff", `current git diff, focus only on ${focus}`));
-		},
+		}),
 	});
 
 	pi.registerCommand("review-fresh", {
 		description: "Fresh-context review in a separate pi process",
-		handler: async (args, ctx) => runFreshReview(pi, ctx, "diff", args),
+		handler: reviewHandler(async (args, ctx) => runFreshReview(pi, ctx, "diff", args)),
 	});
 
 	pi.registerCommand("review-fresh-staged", {
 		description: "Fresh-context review of staged changes",
-		handler: async (args, ctx) => runFreshReview(pi, ctx, "staged", args),
+		handler: reviewHandler(async (args, ctx) => runFreshReview(pi, ctx, "staged", args)),
 	});
 
 	pi.registerCommand("review-fresh-branch", {
 		description: "Fresh-context review of branch against upstream/main",
-		handler: async (args, ctx) => runFreshReview(pi, ctx, "branch", args),
+		handler: reviewHandler(async (args, ctx) => runFreshReview(pi, ctx, "branch", args)),
 	});
 
 	pi.registerCommand("review-fresh-duo", {
 		description: "Run terse + detailed fresh reviews, then synthesize",
-		handler: async (args, ctx) => runFreshDuoReview(pi, ctx, "diff", args),
+		handler: reviewHandler(async (args, ctx) => runFreshDuoReview(pi, ctx, "diff", args)),
 	});
 
 	pi.registerCommand("review-fresh-duo-staged", {
 		description: "Duo review of staged changes",
-		handler: async (args, ctx) => runFreshDuoReview(pi, ctx, "staged", args),
+		handler: reviewHandler(async (args, ctx) => runFreshDuoReview(pi, ctx, "staged", args)),
 	});
 
 	pi.registerCommand("review-fresh-duo-branch", {
 		description: "Duo review of branch against upstream/main",
-		handler: async (args, ctx) => runFreshDuoReview(pi, ctx, "branch", args),
+		handler: reviewHandler(async (args, ctx) => runFreshDuoReview(pi, ctx, "branch", args)),
 	});
 
 	pi.registerCommand("review-model-current", {
 		description: "Set fresh-review model to the currently selected model",
-		handler: async (_args, ctx) => {
+		handler: reviewHandler(async (_args, ctx) => {
 			reviewModel = currentModelPattern(ctx);
 			ctx.ui.notify(reviewModel ? `Fresh-review model: ${reviewModel}` : "No active model found", reviewModel ? "info" : "warning");
-		},
+		}),
 	});
 
 	pi.registerCommand("review-model", {
 		description: "Set or show fresh-review model pattern",
-		handler: async (args, ctx) => {
+		handler: reviewHandler(async (args, ctx) => {
 			const model = args.trim();
 			if (!model) {
 				ctx.ui.notify(`Fresh-review model: ${reviewModel ?? currentModelPattern(ctx) ?? "unset"}`, "info");
@@ -417,20 +597,20 @@ export default function reviewRecent(pi: ExtensionAPI) {
 			}
 			reviewModel = model;
 			ctx.ui.notify(`Fresh-review model: ${reviewModel}`, "info");
-		},
+		}),
 	});
 
 	pi.registerCommand("review-model-clear", {
 		description: "Use current session model for fresh reviews",
-		handler: async (_args, ctx) => {
+		handler: reviewHandler(async (_args, ctx) => {
 			reviewModel = undefined;
 			ctx.ui.notify("Fresh-review model cleared; using current session model", "info");
-		},
+		}),
 	});
 
 	pi.registerCommand("review-help", {
 		description: "List review helper commands",
-		handler: async (_args, ctx) => {
+		handler: reviewHandler(async (_args, ctx) => {
 			ctx.ui.notify([
 				"/review-recent [scope] — inline review current diff",
 				"/review-staged [scope] — inline review staged diff",
@@ -446,7 +626,7 @@ export default function reviewRecent(pi: ExtensionAPI) {
 				"/review-model [provider/model] — set/show fresh-review model",
 				"/review-model-clear — use current session model",
 			].join("\n"), "info");
-		},
+		}),
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
