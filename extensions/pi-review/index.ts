@@ -1,6 +1,8 @@
 import { spawn } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { saveReviewRecord } from "./review-records";
+import { findWorkspaceRoot, reviewRecordOutputDir, saveReviewRecord } from "./review-records";
 
 const CURRENT_VERSION = "0.1.2";
 const TAGS_URL = "https://api.github.com/repos/frankapps-labs/pi-review/tags?per_page=20";
@@ -109,6 +111,31 @@ Rules:
 - If both reviews found nothing, output exactly: No issues.`;
 }
 
+function verifyReviewPrompt(recordJson: string, sourcePath: string): string {
+	return `Verify current changes against this prior pi-review record.
+
+Source review record path: ${sourcePath}
+
+Prior review record JSON:
+\`\`\`json
+${recordJson}
+\`\`\`
+
+Task:
+- Inspect the current git diff and relevant current code using read-only tools.
+- Verify whether the prior review findings were fixed.
+- Do not perform a broad fresh review. Only mention new issues if they are regressions introduced by the attempted fixes.
+- Classify each prior finding as exactly one of:
+  - fixed
+  - partially fixed
+  - not fixed
+  - unclear/no longer applicable
+  - new regression from attempted fix
+- Include evidence with file:line where possible.
+- If a prior finding is not represented in the record, say so and explain how you inferred it.
+- End with a final verdict exactly in this form: Verdict: pass | needs-work | unclear`;
+}
+
 function defaultTarget(mode: ReviewMode): string {
 	switch (mode) {
 		case "diff":
@@ -144,6 +171,13 @@ type ReviewUsage = {
 };
 
 type PiReviewResult = { code: number; output: string; stderr: string; usage?: ReviewUsage };
+
+type ReviewRecordSummary = {
+	path: string;
+	kind: string;
+	generatedAt: string;
+	mtimeMs: number;
+};
 
 function formatKb(bytes: number): string {
 	return `${(bytes / 1024).toFixed(1)}KB`;
@@ -197,6 +231,47 @@ function sumUsage(...items: Array<ReviewUsage | undefined>): ReviewUsage | undef
 			total: usages.reduce((sum, usage) => sum + usage.cost.total, 0),
 		},
 	};
+}
+
+function readReviewRecordSummary(path: string): ReviewRecordSummary | undefined {
+	try {
+		const raw = readFileSync(path, "utf-8");
+		const record = JSON.parse(raw) as { kind?: unknown; generated_at?: unknown };
+		const kind = typeof record.kind === "string" ? record.kind : "";
+		if (kind !== "duo_review" && kind !== "fresh_review") return undefined;
+		return {
+			path,
+			kind,
+			generatedAt: typeof record.generated_at === "string" ? record.generated_at : "",
+			mtimeMs: statSync(path).mtimeMs,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function compareReviewRecords(a: ReviewRecordSummary, b: ReviewRecordSummary): number {
+	const aTime = Date.parse(a.generatedAt) || a.mtimeMs;
+	const bTime = Date.parse(b.generatedAt) || b.mtimeMs;
+	return bTime - aTime;
+}
+
+function findLatestReviewRecord(ctx: ExtensionCommandContext): string | undefined {
+	const dir = reviewRecordOutputDir(findWorkspaceRoot(ctx.cwd));
+	if (!existsSync(dir)) return undefined;
+	const records = readdirSync(dir)
+		.filter((name) => name.endsWith(".review-record.json"))
+		.map((name) => readReviewRecordSummary(join(dir, name)))
+		.filter((record): record is ReviewRecordSummary => Boolean(record));
+	const duo = records.filter((record) => record.kind === "duo_review").sort(compareReviewRecords)[0];
+	const fresh = records.filter((record) => record.kind === "fresh_review").sort(compareReviewRecords)[0];
+	return (duo ?? fresh)?.path;
+}
+
+function resolveReviewRecordPath(ctx: ExtensionCommandContext, args: string): string | undefined {
+	const requested = args.trim();
+	if (!requested) return findLatestReviewRecord(ctx);
+	return isAbsolute(requested) ? requested : resolve(ctx.cwd, requested);
 }
 
 async function runPiReview(ctx: ExtensionCommandContext, model: string, prompt: string, progress?: ReviewProgress): Promise<PiReviewResult> {
@@ -391,6 +466,74 @@ async function runFreshDuoReview(pi: ExtensionAPI, ctx: ExtensionCommandContext,
 	piSendAsMessage(pi, `Duo review (${model}, ${elapsed}s, ${formatCost(totalUsage)})\nSaved review record: ${savedPath}\nUsage: terse ${formatCost(terse.usage)}, deep ${formatCost(deep.usage)}, synthesis ${formatCost(synthesis.usage)}\n\n${synthesis.output || "No output."}`);
 }
 
+async function runReviewVerify(pi: ExtensionAPI, ctx: ExtensionCommandContext, args: string): Promise<void> {
+	const model = reviewModel ?? currentModelPattern(ctx);
+	if (!model) {
+		ctx.ui.notify("No active model found. Use /review-model <model> or switch model first.", "warning");
+		return;
+	}
+	const sourcePath = resolveReviewRecordPath(ctx, args);
+	if (!sourcePath) {
+		ctx.ui.notify("No saved review record found under .pi/reviews", "warning");
+		return;
+	}
+	if (!existsSync(sourcePath)) {
+		ctx.ui.notify(`Review record not found: ${sourcePath}`, "warning");
+		return;
+	}
+
+	let recordJson: string;
+	try {
+		recordJson = readFileSync(sourcePath, "utf-8");
+		JSON.parse(recordJson);
+	} catch (err) {
+		ctx.ui.notify(`Could not read review record: ${String(err)}`, "error");
+		return;
+	}
+
+	ctx.ui.notify(`Review verification starting: ${model}`, "info");
+	const startedAt = Date.now();
+	const progress: ReviewProgress = { events: 0, stdoutBytes: 0, stderrBytes: 0 };
+	const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+	let spin = 0;
+	const updateProgress = () => {
+		const elapsed = Math.round((Date.now() - startedAt) / 1000);
+		const mark = spinner[spin++ % spinner.length];
+		ctx.ui.setStatus("review-verify", `${mark} ${elapsed}s ↓${formatKb(progress.stdoutBytes)} err ${formatKb(progress.stderrBytes)}`);
+		ctx.ui.setWidget("review-verify", [
+			`${mark} Review verification running… ${elapsed}s`,
+			`model: ${model}`,
+			`source: ${sourcePath}`,
+			`events: ${progress.events}`,
+			`stdout: ${formatKb(progress.stdoutBytes)}  stderr: ${formatKb(progress.stderrBytes)}`,
+		]);
+	};
+	updateProgress();
+	const progressTimer = setInterval(updateProgress, 500);
+	const result = await runPiReview(ctx, model, verifyReviewPrompt(recordJson, sourcePath), progress);
+
+	clearInterval(progressTimer);
+	const elapsed = Math.round((Date.now() - startedAt) / 1000);
+	ctx.ui.setStatus("review-verify", undefined);
+	ctx.ui.setWidget("review-verify", undefined);
+
+	if (result.code !== 0) {
+		ctx.ui.notify(`Review verification failed (${result.code}) after ${elapsed}s`, "error");
+		piSendAsMessage(pi, `Review verification failed (${result.code}) after ${elapsed}s\n\n${result.stderr || result.output}`);
+		return;
+	}
+
+	const savedPath = saveVerificationReviewRecord(ctx, {
+		model,
+		sourceReviewRecord: sourcePath,
+		elapsedSeconds: elapsed,
+		verification: result.output || "No output.",
+		usage: result.usage,
+	});
+	ctx.ui.notify(`Review verification done in ${elapsed}s; ${formatCost(result.usage)}; saved review record`, "info");
+	piSendAsMessage(pi, `Review verification (${model}, ${elapsed}s, ${formatCost(result.usage)})\nSource review: ${sourcePath}\nSaved review record: ${savedPath}\n\n${result.output || "No output."}`);
+}
+
 function saveFreshReviewRecord(ctx: ExtensionCommandContext, data: {
 	model: string;
 	target: string;
@@ -457,6 +600,29 @@ function saveDuoReviewRecord(ctx: ExtensionCommandContext, data: {
 			rejected_findings: [],
 			fix_summary: "pending",
 			validation: [],
+		},
+	});
+}
+
+function saveVerificationReviewRecord(ctx: ExtensionCommandContext, data: {
+	model: string;
+	sourceReviewRecord: string;
+	elapsedSeconds: number;
+	verification: string;
+	usage?: ReviewUsage;
+}): string {
+	return saveReviewRecord(ctx, {
+		kind: "fix_verification",
+		schema: "pi_review.fix_verification_record.v1",
+		slugParts: ["verify", data.sourceReviewRecord],
+		payload: {
+			model: data.model,
+			source_review_record: data.sourceReviewRecord,
+			target: "current changes against prior review",
+			elapsed_seconds: data.elapsedSeconds,
+			verification: data.verification,
+			usage: data.usage,
+			human_verdict: "pending",
 		},
 	});
 }
@@ -579,6 +745,11 @@ export default function reviewRecent(pi: ExtensionAPI) {
 		handler: reviewHandler(async (args, ctx) => runFreshDuoReview(pi, ctx, "branch", args)),
 	});
 
+	pi.registerCommand("review-verify", {
+		description: "Verify current changes against a saved review record",
+		handler: reviewHandler(async (args, ctx) => runReviewVerify(pi, ctx, args)),
+	});
+
 	pi.registerCommand("review-model-current", {
 		description: "Set fresh-review model to the currently selected model",
 		handler: reviewHandler(async (_args, ctx) => {
@@ -622,6 +793,7 @@ export default function reviewRecent(pi: ExtensionAPI) {
 				"/review-fresh-duo [scope] — terse + detailed fresh reviews, synthesized",
 				"/review-fresh-duo-staged [scope] — duo review staged diff",
 				"/review-fresh-duo-branch [scope] — duo review branch",
+				"/review-verify [review-record-path] — verify fixes against a saved review record",
 				"/review-model-current — pin fresh reviews to current model",
 				"/review-model [provider/model] — set/show fresh-review model",
 				"/review-model-clear — use current session model",

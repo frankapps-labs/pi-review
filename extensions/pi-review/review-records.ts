@@ -40,7 +40,7 @@ export function workspaceRelative(root: string, path: string): string {
 	return rel || ".";
 }
 
-function reviewRecordOutputDir(root: string): string {
+export function reviewRecordOutputDir(root: string): string {
 	const configured = process.env.PI_REVIEW_RECORD_DIR?.trim();
 	if (configured) return isAbsolute(configured) ? configured : join(root, configured);
 	return join(root, ".pi", "reviews");
