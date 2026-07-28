@@ -5,10 +5,10 @@ const { spawn } = require("node:child_process");
 const { resolve } = require("node:path");
 
 const COMMANDS = {
-  duo: "review-fresh-duo",
-  "duo-branch": "review-fresh-duo-branch",
-  "duo-staged": "review-fresh-duo-staged",
-  verify: "review-verify",
+  duo: "pi-review-headless-duo",
+  "duo-branch": "pi-review-headless-duo-branch",
+  "duo-staged": "pi-review-headless-duo-staged",
+  verify: "pi-review-headless-verify",
 };
 
 function usage(message) {
@@ -56,7 +56,7 @@ function parseArgs(argv) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const extension = resolve(__dirname, "../extensions/pi-review/index.ts");
+  const extension = resolve(__dirname, "../extensions/pi-review/headless.ts");
   const commandText = `/${options.command}${
     options.scopeParts.length ? ` ${options.scopeParts.join(" ")}` : ""
   }`;
@@ -64,7 +64,6 @@ async function main() {
     "--mode", "json",
     "--print",
     "--no-session",
-    "--no-extensions",
     "--model", options.model,
     "--extension", extension,
     commandText,
