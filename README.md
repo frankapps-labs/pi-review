@@ -101,6 +101,29 @@ Use a specific model for fresh reviews:
 /review-fresh-duo
 ```
 
+## Headless and automation usage
+
+The package also installs a `pi-review` executable for scripts, coding-agent harnesses, and CI jobs that cannot type TUI slash commands. It runs the same extension command through pi print/JSON mode, keeps the nested reviewers read-only, prints only the final synthesized result, and preserves the normal review record.
+
+```bash
+pi-review duo-branch \
+  --cwd /path/to/repo \
+  --model codex-fa01/gpt-5.6-sol \
+  --record-dir /path/to/private/reviews \
+  "focus on auth, migrations, and release safety"
+```
+
+Supported subcommands:
+
+```text
+pi-review duo [scope]
+pi-review duo-branch [scope]
+pi-review duo-staged [scope]
+pi-review verify /path/to/prior.review-record.json
+```
+
+Useful options are `--cwd`, `--model`, `--record-dir`, and `--pi-bin`. Review records must stay in an appropriate private location when the reviewed repository is public.
+
 ## What to use when
 
 | Situation | Command |

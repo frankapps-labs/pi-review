@@ -3,6 +3,12 @@
   "version": "0.1.2",
   "description": "Fresh-context code review commands for pi.",
   "license": "MIT",
+  "bin": {
+    "pi-review": "./bin/pi-review.cjs"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.cjs"
+  },
   "keywords": [
     "pi-package",
     "pi",
