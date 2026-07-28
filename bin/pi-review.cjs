@@ -64,6 +64,7 @@ async function main() {
     "--mode", "json",
     "--print",
     "--no-session",
+    "--no-extensions",
     "--model", options.model,
     "--extension", extension,
     commandText,
@@ -81,6 +82,7 @@ async function main() {
   let stdoutBuffer = "";
   let stderr = "";
   let result;
+  const diagnosticEvents = [];
   child.stdout.on("data", (chunk) => {
     stdoutBuffer += chunk.toString();
     const lines = stdoutBuffer.split("\n");
@@ -89,6 +91,8 @@ async function main() {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
+        diagnosticEvents.push(line);
+        if (diagnosticEvents.length > 20) diagnosticEvents.shift();
         if (
           event.type === "message_end" &&
           event.message?.role === "custom" &&
@@ -115,6 +119,7 @@ async function main() {
   if (stdoutBuffer.trim()) {
     try {
       const event = JSON.parse(stdoutBuffer);
+      diagnosticEvents.push(stdoutBuffer);
       if (
         event.type === "message_end" &&
         event.message?.role === "custom" &&
@@ -134,6 +139,10 @@ async function main() {
   if (typeof result !== "string" || !result.trim()) {
     console.error("pi-review: command completed without a review-result message");
     if (stderr.trim()) console.error(stderr.trim());
+    if (diagnosticEvents.length) {
+      console.error("pi-review: final pi events:");
+      console.error(diagnosticEvents.join("\n"));
+    }
     process.exit(1);
   }
   process.stdout.write(result.endsWith("\n") ? result : `${result}\n`);

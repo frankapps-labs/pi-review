@@ -67,18 +67,19 @@ test("headless duo branch forwards model, cwd, scope, extension, and record dir"
   const invocation = JSON.parse(readFileSync(capture, "utf8"));
   assert.equal(realpathSync(invocation.cwd), realpathSync(repo));
   assert.equal(invocation.recordDir, recordDir);
-  assert.deepEqual(invocation.argv.slice(0, 7), [
+  assert.deepEqual(invocation.argv.slice(0, 8), [
     "--mode",
     "json",
     "--print",
     "--no-session",
+    "--no-extensions",
     "--model",
     "codex-fa02/gpt-5.6-sol",
     "--extension",
   ]);
-  assert.match(invocation.argv[7], /extensions\/pi-review\/index\.ts$/);
+  assert.match(invocation.argv[8], /extensions\/pi-review\/index\.ts$/);
   assert.equal(
-    invocation.argv[8],
+    invocation.argv[9],
     "/review-fresh-duo-branch review only release safety and scopes",
   );
 });
